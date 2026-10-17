@@ -1,0 +1,659 @@
+// Smart Campus Management System — Prisma schema
+// Provider: SQLite for local demo (zero external services). Schema is kept
+// Postgres-portable; see requirements/06-decisions-and-deviations.md.
+//
+// NOTE: SQLite does not support Prisma `enum` or native CHECK constraints.
+// Enum-like values are stored as validated strings (enforced with Zod in
+// src/lib/validation.ts) and range rules are enforced in the service layer.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// M01/M13 — Identity, sessions, audit
+// ---------------------------------------------------------------------------
+
+model User {
+  id                 String   @id @default(cuid())
+  email              String   @unique
+  loginId            String   @unique // Roll No / Faculty ID / Admin ID
+  passwordHash       String
+  role               String // ADMIN | FACULTY | STUDENT
+  firstName          String
+  lastName           String
+  phone              String?
+  isActive           Boolean  @default(true)
+  mustChangePassword Boolean  @default(false)
+  lastLoginAt        DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  studentProfile     StudentProfile?
+  facultyProfile     FacultyProfile?
+  sessions           Session[]
+  passwordResets     PasswordResetToken[]
+  auditLogs          AuditLog[]
+  notifications      Notification[]
+  borrowRecords      BorrowRecord[]
+  feedbackGiven      Feedback[]         @relation("FeedbackStudent")
+  feedbackAbout      Feedback[]         @relation("FeedbackFaculty")
+  complaints         Complaint[]        @relation("ComplaintStudent")
+  complaintResponses ComplaintResponse[]
+  assistantLogs      AssistantQueryLog[]
+  offerings          SubjectOffering[]  @relation("OfferingFaculty")
+  attendanceMarked   AttendanceRecord[] @relation("AttendanceMarker")
+  marksEntered       MarkEntry[]        @relation("MarksEnterer")
+  assignmentsCreated Assignment[]
+  noticesCreated     Notice[]
+
+  swapRequestsOutgoing  LectureSwapRequest[] @relation("SwapRequester")
+  swapRequestsIncoming  LectureSwapRequest[] @relation("SwapRecipient")
+  cancellationsDeclared LectureCancellation[]
+
+  @@index([role])
+}
+
+model StudentProfile {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  rollNo       String   @unique
+  departmentId String
+  batchId      String?
+  admissionYear Int
+  guardianName String?
+  createdAt    DateTime @default(now())
+
+  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  department        Department  @relation(fields: [departmentId], references: [id])
+  batch             Batch?      @relation(fields: [batchId], references: [id])
+  enrolments        Enrolment[]
+  attendanceRecords AttendanceRecord[]
+  marks             MarkEntry[]
+}
+
+model FacultyProfile {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  employeeNo   String   @unique
+  departmentId String
+  designation  String
+  officeRoom   String?
+  createdAt    DateTime @default(now())
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  department     Department             @relation(fields: [departmentId], references: [id])
+  availabilities FacultyAvailability[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  lastSeenAt DateTime @default(now())
+  ip        String?
+  userAgent String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  tokenHash String    @unique
+  userId    String
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model LoginAttempt {
+  id         String   @id @default(cuid())
+  identifier String
+  ip         String?
+  success    Boolean
+  createdAt  DateTime @default(now())
+
+  @@index([identifier, createdAt])
+  @@index([ip, createdAt])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  timestamp   DateTime @default(now())
+  actorUserId String?
+  actorRole   String?
+  action      String
+  entityType  String?
+  entityId    String?
+  summary     String?
+  ip          String?
+  userAgent   String?
+  result      String // SUCCESS | DENIED | FAILURE
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([actorUserId])
+  @@index([action])
+  @@index([timestamp])
+}
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// M02/M04 — Academic structure
+// ---------------------------------------------------------------------------
+
+model AcademicTerm {
+  id        String   @id @default(cuid())
+  name      String   @unique // e.g. "2026 Even Semester"
+  startDate DateTime
+  endDate   DateTime
+  isActive  Boolean  @default(false)
+
+  batches   Batch[]
+  offerings SubjectOffering[]
+  timetables TimetableVersion[]
+}
+
+model Department {
+  id       String   @id @default(cuid())
+  code     String   @unique
+  name     String
+  students StudentProfile[]
+  faculty  FacultyProfile[]
+  courses  Course[]
+  subjects Subject[]
+}
+
+model Course {
+  id           String   @id @default(cuid())
+  code         String   @unique
+  name         String
+  departmentId String
+  durationYears Int     @default(4)
+
+  department Department @relation(fields: [departmentId], references: [id])
+  subjects   Subject[]
+  batches    Batch[]
+}
+
+model Subject {
+  id         String   @id @default(cuid())
+  code       String   @unique
+  name       String
+  courseId   String
+  departmentId String
+  credits    Int      @default(3)
+  semester   Int      @default(1)
+  isLab      Boolean  @default(false)
+
+  course       Course        @relation(fields: [courseId], references: [id])
+  department   Department    @relation(fields: [departmentId], references: [id])
+  offerings    SubjectOffering[]
+  exams        Exam[]
+}
+
+model Batch {
+  id        String   @id @default(cuid())
+  name      String // e.g. "CSE-2026-A"
+  courseId  String
+  termId    String
+  semester  Int
+  strength  Int      @default(60)
+
+  course    Course    @relation(fields: [courseId], references: [id])
+  term      AcademicTerm @relation(fields: [termId], references: [id])
+  students  StudentProfile[]
+  offerings SubjectOffering[]
+  enrolments Enrolment[]
+  slots     TimetableSlot[]
+  exams     Exam[]
+
+  @@unique([name, termId])
+}
+
+model Classroom {
+  id       String  @id @default(cuid())
+  code     String  @unique
+  name     String
+  capacity Int
+  type     String  @default("LECTURE") // LECTURE | LAB
+  building String?
+
+  slots TimetableSlot[]
+  sessions ClassSession[]
+  exams Exam[]
+}
+
+model SubjectOffering {
+  id             String @id @default(cuid())
+  subjectId      String
+  batchId        String
+  facultyId      String // User.id of the faculty member
+  termId         String
+  weeklySessions Int    @default(3)
+
+  subject   Subject        @relation(fields: [subjectId], references: [id])
+  batch     Batch          @relation(fields: [batchId], references: [id])
+  faculty   User           @relation("OfferingFaculty", fields: [facultyId], references: [id])
+  term      AcademicTerm   @relation(fields: [termId], references: [id])
+  slots     TimetableSlot[]
+  sessions  ClassSession[]
+  assignments Assignment[]
+
+  @@unique([subjectId, batchId, termId])
+}
+
+model Enrolment {
+  id        String @id @default(cuid())
+  studentId String // StudentProfile.id
+  batchId   String
+  createdAt DateTime @default(now())
+
+  student StudentProfile @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  batch   Batch          @relation(fields: [batchId], references: [id])
+
+  @@unique([studentId, batchId])
+}
+
+model Period {
+  id        String @id @default(cuid())
+  index     Int    @unique // 1..N
+  label     String
+  startTime String
+  endTime   String
+}
+
+model FacultyAvailability {
+  id          String  @id @default(cuid())
+  facultyId   String // User.id
+  day         Int // 1=Mon .. 6=Sat
+  periodIndex Int
+  available   Boolean @default(true)
+
+  faculty FacultyProfile @relation(fields: [facultyId], references: [userId])
+
+  @@unique([facultyId, day, periodIndex])
+}
+
+// ---------------------------------------------------------------------------
+// M05 — Timetable
+// ---------------------------------------------------------------------------
+
+model TimetableVersion {
+  id              String   @id @default(cuid())
+  termId          String
+  versionNumber   Int
+  status          String   @default("DRAFT") // DRAFT|GENERATED|IN_REVIEW|APPROVED|PUBLISHED|ARCHIVED
+  createdById     String
+  approvedById    String?
+  approvedAt      DateTime?
+  publishedAt     DateTime?
+  parentVersionId String?
+  diagnostics     String? // JSON text: conflicts + suggestions
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  term   AcademicTerm  @relation(fields: [termId], references: [id])
+  slots  TimetableSlot[]
+  swapRequests LectureSwapRequest[]
+
+  @@unique([termId, versionNumber])
+}
+
+model TimetableSlot {
+  id          String @id @default(cuid())
+  versionId   String
+  offeringId  String
+  classroomId String
+  facultyId   String
+  batchId     String
+  day         Int // 1=Mon .. 6=Sat
+  periodIndex Int
+  slotType    String @default("LECTURE") // LECTURE | LAB
+
+  version   TimetableVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  offering  SubjectOffering   @relation(fields: [offeringId], references: [id])
+  classroom Classroom         @relation(fields: [classroomId], references: [id])
+  batch     Batch             @relation(fields: [batchId], references: [id])
+  sessions  ClassSession[]
+
+  swapRequestsAsRequester LectureSwapRequest[] @relation("SwapRequesterSlot")
+  swapRequestsAsRecipient LectureSwapRequest[] @relation("SwapRecipientSlot")
+  cancellations           LectureCancellation[]
+
+  // Hard-constraint guards: no faculty / room / batch double-booking per version.
+  @@unique([versionId, facultyId, day, periodIndex])
+  @@unique([versionId, classroomId, day, periodIndex])
+  @@unique([versionId, batchId, day, periodIndex])
+  @@index([versionId])
+}
+
+// ---------------------------------------------------------------------------
+// M06 — Attendance
+// ---------------------------------------------------------------------------
+
+model ClassSession {
+  id          String   @id @default(cuid())
+  offeringId  String
+  slotId      String?
+  classroomId String?
+  date        DateTime
+  day         Int
+  periodIndex Int
+  topic       String?
+  createdAt   DateTime @default(now())
+
+  offering  SubjectOffering   @relation(fields: [offeringId], references: [id])
+  slot      TimetableSlot?    @relation(fields: [slotId], references: [id])
+  classroom Classroom?        @relation(fields: [classroomId], references: [id])
+  records   AttendanceRecord[]
+  cancellations LectureCancellation[]
+
+  @@index([offeringId])
+}
+
+model AttendanceRecord {
+  id             String   @id @default(cuid())
+  classSessionId String
+  studentId      String // StudentProfile.id
+  status         String // PRESENT | ABSENT
+  markedById     String // User.id
+  markedAt       DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  classSession ClassSession  @relation(fields: [classSessionId], references: [id], onDelete: Cascade)
+  student      StudentProfile @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  markedBy     User           @relation("AttendanceMarker", fields: [markedById], references: [id])
+
+  @@unique([classSessionId, studentId])
+  @@index([studentId])
+}
+
+// ---------------------------------------------------------------------------
+// M11/M03 — Exams, marks, assignments
+// ---------------------------------------------------------------------------
+
+model Assignment {
+  id          String   @id @default(cuid())
+  offeringId  String
+  title       String
+  description String
+  deadline    DateTime
+  maxMarks    Int      @default(100)
+  createdById String
+  createdAt   DateTime @default(now())
+
+  offering  SubjectOffering @relation(fields: [offeringId], references: [id])
+  createdBy User            @relation(fields: [createdById], references: [id])
+
+  @@index([offeringId])
+}
+
+model Exam {
+  id             String   @id @default(cuid())
+  subjectId      String
+  batchId        String
+  termId         String
+  name           String
+  examDate       DateTime
+  startTime      String
+  endTime        String
+  classroomId    String?
+  maxMarks       Int      @default(100)
+  invigilatorId  String?
+  resultPublished Boolean @default(false)
+  publishedAt    DateTime?
+
+  subject    Subject    @relation(fields: [subjectId], references: [id])
+  batch      Batch      @relation(fields: [batchId], references: [id])
+  classroom  Classroom? @relation(fields: [classroomId], references: [id])
+  marks      MarkEntry[]
+
+  @@index([batchId])
+}
+
+model MarkEntry {
+  id         String   @id @default(cuid())
+  examId     String
+  studentId  String // StudentProfile.id
+  marks      Float
+  enteredById String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  exam      Exam           @relation(fields: [examId], references: [id], onDelete: Cascade)
+  student   StudentProfile @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  enteredBy User           @relation("MarksEnterer", fields: [enteredById], references: [id])
+
+  @@unique([examId, studentId])
+  @@index([studentId])
+}
+
+// ---------------------------------------------------------------------------
+// M08 — Notices and notifications
+// ---------------------------------------------------------------------------
+
+model Notice {
+  id          String   @id @default(cuid())
+  title       String
+  body        String
+  audience    String // ALL | ADMIN | FACULTY | STUDENT | COURSE | BATCH
+  courseId    String?
+  batchId     String?
+  createdById String
+  isPublished Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  createdBy User @relation(fields: [createdById], references: [id])
+
+  @@index([audience])
+}
+
+model Notification {
+  id             String   @id @default(cuid())
+  userId         String
+  type           String
+  title          String
+  body           String
+  link           String?
+  isRead         Boolean  @default(false)
+  idempotencyKey String?  @unique
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+}
+
+// ---------------------------------------------------------------------------
+// M12 — Library
+// ---------------------------------------------------------------------------
+
+model Book {
+  id              String   @id @default(cuid())
+  title           String
+  author          String
+  isbn            String   @unique
+  category        String
+  totalCopies     Int      @default(1)
+  availableCopies Int      @default(1)
+  createdAt       DateTime @default(now())
+
+  borrowRecords BorrowRecord[]
+
+  @@index([title])
+  @@index([category])
+}
+
+model BorrowRecord {
+  id         String    @id @default(cuid())
+  bookId     String
+  userId     String
+  borrowedAt DateTime  @default(now())
+  dueDate    DateTime
+  returnedAt DateTime?
+  status     String    @default("BORROWED") // BORROWED | RETURNED | OVERDUE
+
+  book Book @relation(fields: [bookId], references: [id])
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([bookId])
+}
+
+// ---------------------------------------------------------------------------
+// M10 — Feedback and complaints
+// ---------------------------------------------------------------------------
+
+model Feedback {
+  id        String   @id @default(cuid())
+  studentId String // User.id
+  facultyId String? // User.id (subject of feedback)
+  subject   String
+  message   String
+  isAnonymous Boolean @default(true)
+  createdAt DateTime @default(now())
+
+  student User  @relation("FeedbackStudent", fields: [studentId], references: [id])
+  faculty User? @relation("FeedbackFaculty", fields: [facultyId], references: [id])
+}
+
+model Complaint {
+  id        String   @id @default(cuid())
+  studentId String // User.id
+  category  String
+  subject   String
+  message   String
+  status    String   @default("SUBMITTED") // SUBMITTED|IN_REVIEW|RESOLVED|REJECTED
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  student   User                @relation("ComplaintStudent", fields: [studentId], references: [id])
+  responses ComplaintResponse[]
+
+  @@index([studentId])
+  @@index([status])
+}
+
+model ComplaintResponse {
+  id              String   @id @default(cuid())
+  complaintId     String
+  adminId         String
+  message         String
+  statusChange    String?
+  createdAt       DateTime @default(now())
+
+  complaint Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+  admin     User      @relation(fields: [adminId], references: [id])
+}
+
+// ---------------------------------------------------------------------------
+// M09 — AI assistant (retrieval-only knowledge base)
+// ---------------------------------------------------------------------------
+
+model KnowledgeDocument {
+  id         String   @id @default(cuid())
+  title      String
+  category   String
+  content    String
+  isApproved Boolean  @default(false)
+  version    Int      @default(1)
+  updatedAt  DateTime @updatedAt
+
+  @@index([isApproved])
+}
+
+model AssistantQueryLog {
+  id          String   @id @default(cuid())
+  userId      String
+  role        String
+  question    String
+  intent      String
+  sourcesUsed String?
+  answered    Boolean
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// M05 — Faculty-to-faculty lecture swap requests
+// ---------------------------------------------------------------------------
+// A swap exchanges the time position (day + periodIndex) of two PUBLISHED
+// TimetableSlots owned by two different faculty members. Each slot keeps its own
+// offering/batch/classroom, so the invariant slot.facultyId == offering.facultyId
+// (relied on by attendance/marks authorization) is preserved.
+
+model LectureSwapRequest {
+  id                String   @id @default(cuid())
+  versionId         String // TimetableVersion.id (both slots must belong to it)
+  requesterId       String // User.id (faculty requesting the swap)
+  recipientId       String // User.id (faculty whose consent is required)
+  requesterSlotId   String // TimetableSlot.id owned by the requester
+  recipientSlotId   String // TimetableSlot.id owned by the recipient
+  reason            String?
+  status            String   @default("PENDING") // PENDING|ACCEPTED|REJECTED|FINALIZED|FAILED|CANCELLED
+  requesterApproved Boolean  @default(true) // creating the request is the requester's consent
+  recipientApproved Boolean  @default(false)
+  decidedAt         DateTime?
+  finalizedAt       DateTime?
+  failureReason     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  version       TimetableVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  requester     User             @relation("SwapRequester", fields: [requesterId], references: [id])
+  recipient     User             @relation("SwapRecipient", fields: [recipientId], references: [id])
+  requesterSlot TimetableSlot    @relation("SwapRequesterSlot", fields: [requesterSlotId], references: [id])
+  recipientSlot TimetableSlot    @relation("SwapRecipientSlot", fields: [recipientSlotId], references: [id])
+
+  @@index([status])
+  @@index([requesterId])
+  @@index([recipientId])
+  @@index([requesterSlotId])
+  @@index([recipientSlotId])
+}
+
+// ---------------------------------------------------------------------------
+// M06 — Lecture cancellation (a specific slot on a specific date)
+// ---------------------------------------------------------------------------
+// Cancelling a single occurrence, not the whole recurring slot. Attendance,
+// marks and historical sessions are never deleted.
+
+model LectureCancellation {
+  id             String   @id @default(cuid())
+  slotId         String // TimetableSlot.id
+  classSessionId String? // existing ClassSession for that date, when one exists
+  date           DateTime // UTC midnight of the cancelled occurrence
+  cancelledById  String // User.id (faculty owner or admin)
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  slot         TimetableSlot @relation(fields: [slotId], references: [id], onDelete: Cascade)
+  classSession ClassSession? @relation(fields: [classSessionId], references: [id])
+  cancelledBy  User          @relation(fields: [cancelledById], references: [id])
+
+  // Prevents duplicate cancellations for the same lecture on the same date.
+  @@unique([slotId, date])
+  @@index([date])
+}
