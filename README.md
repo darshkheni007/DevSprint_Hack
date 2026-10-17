@@ -74,7 +74,7 @@ see [Key features](#key-features).
 | Area | What works |
 |---|---|
 | **Authentication & sessions** | Email / roll-number / institutional-ID sign-in, bcrypt password hashing (cost 12), server-side session records with idle + absolute expiry, failed-login tracking, sign-out, change-own-password. |
-| **Role-based access control** | A single policy module (`src/lib/permissions.ts`) gates every protected action with `authorize(actor, action, ctx)`. Ownership, assignment and *published-only* scope rules are enforced in the service layer, not in the UI. |
+| **Role-based access control** | A single policy module (`src/lib/permissions.ts`) gates protected operations with `authorize(actor, action, ctx)`; a few self-scoped operations (such as changing your own password) act on the caller's own ID instead. Ownership, assignment and *published-only* scope rules are enforced in the service layer, not in the UI. |
 | **Admin dashboard** | Institution overview, student/faculty management, academic structure (departments, courses, subjects, batches, classrooms), timetable generation/review/approval/publishing, attendance oversight, examinations, notices, analytics, audit log, system settings. |
 | **Faculty dashboard** | Own timetable, attendance recording against class sessions, marks entry, assignment creation, course/batch notices, lecture-swap requests, lecture cancellation. |
 | **Student dashboard** | Own published timetable, attendance history and percentage, published results, assignments, notices, library catalogue and borrowing, feedback and complaint submission, notification centre. |
@@ -101,7 +101,7 @@ These are **not** implemented. They are listed so the boundary is clear.
 | Password reset / "forgot password" flow | Not implemented. An unused `PasswordResetToken` model exists in the schema; no service, action or page uses it. |
 | Email and SMS delivery | Not implemented. `SMTP_URL` and `SMS_PROVIDER_KEY` exist as placeholders in `.env.example`; notifications are **in-app only**. |
 | Report export (CSV/PDF download) | Not implemented. Analytics are view-only. |
-| Library due-date reminders and exam reminders | Not implemented. `LIBRARY_DUE` and `ACCOUNT` are declared in the notification type list but are never emitted, and there is no scheduler — reminders are not sent on a timer. |
+| Scheduled reminders (library due dates, exam dates) | Not implemented. There is no scheduler, so nothing is sent on a timer. `LIBRARY_DUE` and `ACCOUNT` are declared in the notification type list but are never emitted anywhere. (`EXAM_REMINDER` is reused for "results published" notifications, not for scheduled reminders.) |
 | Automated backups | Not implemented. |
 | Student assignment file submission | Not implemented. Students view assignments and deadlines only. |
 | Library fines and payments | Out of scope by design. Only due dates are tracked. |
@@ -184,12 +184,13 @@ Key structural decisions:
   the scope rules (ownership, assigned faculty, published-only). See
   [Security and privacy](#security-and-privacy).
 - **The timetable state machine is explicit.** `TIMETABLE_TRANSITIONS` in
-  `src/lib/constants.ts` allows only `GENERATED → IN_REVIEW → APPROVED → PUBLISHED`, so a
-  timetable can never be auto-published.
+  `src/lib/constants.ts` makes `APPROVED → PUBLISHED` the only route to publication (versions
+  start at `DRAFT`/`GENERATED` and can be archived or returned to `IN_REVIEW`), so a timetable
+  can never be auto-published.
 - **Attendance hangs off dated class sessions**, not timetable slots, so history stays
   correct when a timetable is later regenerated.
-- **Notifications are idempotent** via an idempotency key, so repeated triggers do not
-  duplicate messages.
+- **Notifications are idempotent when an idempotency key is supplied**, so repeated triggers do
+  not duplicate messages.
 
 ---
 
@@ -221,6 +222,7 @@ marks.
 
 | Module | Primary routes |
 |---|---|
+| Entry point | `/` (redirects to the signed-in user's dashboard) |
 | Authentication | `/login`, `/account` |
 | Admin dashboard | `/admin`, `/admin/users`, `/admin/academic`, `/admin/timetable`, `/admin/attendance`, `/admin/exams`, `/admin/notices`, `/admin/complaints`, `/admin/analytics`, `/admin/audit`, `/admin/settings` |
 | Faculty dashboard | `/faculty`, `/faculty/timetable`, `/faculty/attendance`, `/faculty/attendance/[sessionId]`, `/faculty/marks`, `/faculty/assignments`, `/faculty/notices`, `/faculty/swaps` |
@@ -318,9 +320,9 @@ npm install
 # 3. Create your local environment file from the template
 Copy-Item .env.example .env
 
-# 4. Edit .env and set SESSION_SECRET to a long random value
-#    Generate one with:
-#    node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+# 4. Review .env. The defaults work for local development; adjust the session
+#    lifetimes if you want. SESSION_SECRET and ATTENDANCE_THRESHOLD_PERCENT are
+#    present in the template but are NOT read by the application.
 
 # 5. Generate the Prisma client, create the SQLite database and seed demo data
 npm run setup
@@ -345,10 +347,10 @@ All variables are documented in [`.env.example`](./.env.example). Copy it to `.e
 | Variable | Required | Purpose |
 |---|---|---|
 | `DATABASE_URL` | Yes | Prisma connection string. Default `file:./dev.db`. Relative SQLite paths resolve **against the `prisma/` directory**, so this file is `prisma/dev.db`. |
-| `SESSION_SECRET` | Yes | Signing secret for session cookies. Use a long random value; never reuse a placeholder. |
+| `SESSION_SECRET` | No | **Not read by the application.** Present in the template only. Sessions do not use a signing secret — see [Security and privacy](#security-and-privacy). |
 | `SESSION_IDLE_MINUTES` | Yes | Idle session timeout in minutes. |
 | `SESSION_ABSOLUTE_MINUTES` | Yes | Maximum session lifetime in minutes. |
-| `ATTENDANCE_THRESHOLD_PERCENT` | Yes | Percentage below which attendance is flagged, e.g. `75`. |
+| `ATTENDANCE_THRESHOLD_PERCENT` | No | **Not read by the application.** The live threshold is stored in the database and edited in Admin → Settings (default `75`). |
 | `SMTP_URL` | Optional | Reserved for email delivery. **Not implemented** — leave blank. |
 | `SMS_PROVIDER_KEY` | Optional | Reserved for SMS delivery. **Not implemented** — leave blank. |
 | `LLM_API_KEY` | Optional | Enables the LLM-backed assistant. Leave empty for retrieval-only answers. |
@@ -520,7 +522,10 @@ resetting your local database, so treat it as **local demo data only**.
 ## Security and privacy
 
 **Authentication.** Passwords are hashed with bcrypt (cost 12). Sessions are stored server-side
-with both idle and absolute expiry, and failed sign-in attempts are recorded.
+with both idle and absolute expiry, and failed sign-in attempts are recorded. The browser holds
+an opaque 256-bit random token in an httpOnly, SameSite cookie, and only that token's SHA-256
+hash is stored in the database — so a database leak does not expose usable session tokens. There
+is no cookie signing secret, which is why `SESSION_SECRET` is unused.
 
 **Authorization.** All protected operations go through `authorize(actor, action, ctx)` in
 `src/lib/permissions.ts`. The policy combines a role capability matrix with scope rules:
@@ -610,7 +615,7 @@ A production server can be run locally with the scripts that exist:
 
 ```powershell
 npm install
-Copy-Item .env.example .env   # then set real values, including a strong SESSION_SECRET
+Copy-Item .env.example .env   # review values (DATABASE_URL and the session lifetimes)
 npm run build
 npm run start                 # serves the production build on http://localhost:3000
 ```
@@ -622,7 +627,8 @@ If you deploy this application, note that:
 - The schema is written to be Postgres-portable, but **Postgres has not been tested**. Switching
   providers requires changing the `datasource` in `prisma/schema.prisma`, supplying a
   `DATABASE_URL`, generating a client, and creating the schema.
-- Set a strong, unique `SESSION_SECRET` and never reuse the placeholder.
+- `SESSION_SECRET` and `ATTENDANCE_THRESHOLD_PERCENT` are present in `.env.example` but are
+  **not read by the application**. Do not rely on them for security or configuration.
 - Serve over HTTPS and add HSTS.
 - The demo credential panel on the sign-in page is disabled automatically when
   `NODE_ENV=production`; verify this before exposing the app publicly.
