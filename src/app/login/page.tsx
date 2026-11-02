@@ -12,7 +12,9 @@ export const metadata: Metadata = { title: "Sign in" };
 export default async function LoginPage() {
   const actor = await getCurrentActor();
   if (actor) redirect(roleHomePath(actor.role as Role));
-  const showDemo = process.env.NODE_ENV !== "production";
+  const showDemo =
+    process.env.NODE_ENV !== "production" ||
+    process.env.SHOW_DEMO_ACCOUNTS === "true";
 
   return (
     <div className="grid min-h-screen lg:grid-cols-2">

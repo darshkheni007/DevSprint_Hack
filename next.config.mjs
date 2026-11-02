@@ -30,6 +30,16 @@ const nextConfig = {
   // Hide the on-screen development indicator (bottom-left badge). Compile and
   // runtime errors are still surfaced by the framework.
   devIndicators: false,
+  // Vercel traces only files imported by server code. The SQLite demo database
+  // and the per-deployment session secret are read with `fs`, so they must be
+  // included explicitly in every server function. See scripts/prepare-vercel.mjs.
+  outputFileTracingIncludes: {
+    "/*": [
+      "./prisma/seed.db",
+      "./.vercel-session-secret",
+      "./node_modules/.prisma/client/**/*",
+    ],
+  },
   async headers() {
     return [{ source: "/(.*)", headers: securityHeaders }];
   },

@@ -289,8 +289,8 @@ only.
 **No screenshots are included in this repository.** None exist in the project, and none have
 been fabricated here. To see the UI, run the application locally
 (see [Installation and setup](#installation-and-setup-windows-powershell)) and sign in with a
-demo account. The sign-in screen lists the demo accounts and displays the shared demo password
-in development.
+demo account. The sign-in screen lists the demo accounts and displays the shared demo password in
+development (or in production when `SHOW_DEMO_ACCOUNTS=true`).
 
 ---
 
@@ -347,10 +347,11 @@ All variables are documented in [`.env.example`](./.env.example). Copy it to `.e
 | Variable | Required | Purpose |
 |---|---|---|
 | `DATABASE_URL` | Yes | Prisma connection string. Default `file:./dev.db`. Relative SQLite paths resolve **against the `prisma/` directory**, so this file is `prisma/dev.db`. |
-| `SESSION_SECRET` | No | **Not read by the application.** Present in the template only. Sessions do not use a signing secret — see [Security and privacy](#security-and-privacy). |
+| `SESSION_SECRET` | No | Signs stateless session cookies on serverless hosts (Vercel). Locally sessions are database-backed and this value is not read. If it is omitted on Vercel, `scripts/prepare-vercel.mjs` generates a per-deployment secret. Set a long random value yourself if sessions must survive redeploys. |
 | `SESSION_IDLE_MINUTES` | Yes | Idle session timeout in minutes. |
 | `SESSION_ABSOLUTE_MINUTES` | Yes | Maximum session lifetime in minutes. |
 | `ATTENDANCE_THRESHOLD_PERCENT` | No | **Not read by the application.** The live threshold is stored in the database and edited in Admin → Settings (default `75`). |
+| `SHOW_DEMO_ACCOUNTS` | No | Set to `true` to show the demo credential panel in a production deployment (demo only; leave unset when the app is public). |
 | `SMTP_URL` | Optional | Reserved for email delivery. **Not implemented** — leave blank. |
 | `SMS_PROVIDER_KEY` | Optional | Reserved for SMS delivery. **Not implemented** — leave blank. |
 | `LLM_API_KEY` | Optional | Enables the LLM-backed assistant. Leave empty for retrieval-only answers. |
@@ -456,7 +457,8 @@ share one demo password.
 Sign in with an **email, roll number or institutional ID**.
 
 The shared demo password is **not reproduced in this README**. It is displayed on the sign-in
-screen when the app is not running in production (`NODE_ENV !== "production"`) and is defined
+screen when the app is not running in production (`NODE_ENV !== "production"`), or in production
+when `SHOW_DEMO_ACCOUNTS=true`, and is defined
 in `src/lib/demo-accounts.ts`. Changing the demo password requires editing that file and
 resetting your local database, so treat it as **local demo data only**.
 
@@ -521,11 +523,19 @@ resetting your local database, so treat it as **local demo data only**.
 
 ## Security and privacy
 
-**Authentication.** Passwords are hashed with bcrypt (cost 12). Sessions are stored server-side
-with both idle and absolute expiry, and failed sign-in attempts are recorded. The browser holds
-an opaque 256-bit random token in an httpOnly, SameSite cookie, and only that token's SHA-256
-hash is stored in the database — so a database leak does not expose usable session tokens. There
-is no cookie signing secret, which is why `SESSION_SECRET` is unused.
+**Authentication.** Passwords are hashed with bcrypt (cost 12). Locally, sessions are stored
+server-side with both idle and absolute expiry, and failed sign-in attempts are recorded. The
+browser holds an opaque 256-bit random token in an httpOnly, SameSite cookie, and only that
+token's SHA-256 hash is stored in the database — so a database leak does not expose usable
+session tokens. Locally there is no cookie signing secret, so `SESSION_SECRET` is unused.
+
+On serverless hosts (Vercel) the database file is ephemeral and per-instance, so a session row
+cannot be shared between requests. In that environment the cookie is a stateless token signed
+with HMAC-SHA256 using `SESSION_SECRET` (or the per-deployment secret generated at build time).
+It is httpOnly, SameSite=Lax, Secure, and expires after the absolute session lifetime. The
+trade-off is that stateless tokens cannot be revoked server-side: logout clears the cookie, but
+a token copied from another device remains valid until it expires. For a real deployment, use a
+hosted Postgres/Turso database and database-backed sessions instead.
 
 **Authorization.** All protected operations go through `authorize(actor, action, ctx)` in
 `src/lib/permissions.ts`. The policy combines a role capability matrix with scope rules:
@@ -581,6 +591,10 @@ placeholders only. No environment variable is exposed to the browser.
 Current limitations:
 
 - SQLite only; concurrent write throughput is limited by SQLite's single-writer model.
+- On Vercel, `/tmp` is ephemeral and per-instance. Reads and sign-in work, but writes are not
+  shared between instances and are lost on cold start or redeploy.
+- Stateless Vercel sessions cannot be revoked server-side; a copied token remains valid until it
+  expires. Local database-backed sessions do support revocation.
 - Timetable generation is a deterministic constraint solver, not an optimizer — it finds a
   valid schedule, not necessarily the best one.
 - Notifications are in-app only; there is no email or SMS delivery.
@@ -607,11 +621,41 @@ review of this codebase):
 
 ## Deployment
 
-**No deployment target is configured for this repository.** There is no Dockerfile, no
-`vercel.json`, no platform manifest and no CI workflow, so no deployment has been performed or
-verified.
+The repository now includes a Vercel build entry point (`vercel.json` +
+`npm run vercel-build`) so the SQLite demo can run on Vercel's serverless runtime.
 
-A production server can be run locally with the scripts that exist:
+### How the Vercel deployment works
+
+Vercel mounts the deployment **read-only** and provides only ephemeral, per-instance `/tmp`
+scratch space. The git-ignored `prisma/dev.db` therefore never reaches production. The
+deployment build does the following:
+
+1. `npm run vercel-build` (`scripts/prepare-vercel.mjs`) generates the Prisma client.
+2. It creates and seeds a bundled SQLite demo database at `prisma/seed.db`.
+3. It generates a per-deployment session signing secret at `.vercel-session-secret` (unless
+   `SESSION_SECRET` is set).
+4. `next build` runs; `next.config.mjs` traces both files into every server function.
+5. At runtime `src/lib/db.ts` copies `prisma/seed.db` to `/tmp` (writable) and points Prisma at
+   that copy. Because the copy is made from the same bundled seed on every instance, demo user
+   IDs are stable, and login/redirect works across instances.
+6. Because session rows cannot be shared between instances, Vercel uses a signed, stateless
+   session cookie (HMAC-SHA256) instead of the local database-backed session. Any instance can
+   verify it.
+
+No extra configuration is required for the demo. Optional environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `SESSION_SECRET` | Set a long random value to keep sessions valid across redeploys. If unset, a new per-deployment secret is generated automatically. |
+| `SHOW_DEMO_ACCOUNTS=true` | Show the demo credential panel in the production deployment (demo only). |
+
+> **Important limitation.** `/tmp` is ephemeral and per-instance. Reads work everywhere, but
+> demo writes (attendance, marks, notices, complaints, etc.) are only visible on the instance
+> that handled the write and are lost on cold start or redeploy. For a persistent production
+> deployment, use a hosted Postgres/Turso database and database-backed sessions. See
+> [Known limitations](#known-limitations-and-future-improvements).
+
+### Running production locally
 
 ```powershell
 npm install
@@ -620,18 +664,17 @@ npm run build
 npm run start                 # serves the production build on http://localhost:3000
 ```
 
-If you deploy this application, note that:
+`npm run vercel-build` also works locally and produces the same bundled `prisma/seed.db`; it is
+what Vercel executes.
 
-- The database is a **local SQLite file**, so hosting must provide persistent, writable disk.
-  Ephemeral or multi-instance hosts will lose or split the database.
+Other deployment notes:
+
 - The schema is written to be Postgres-portable, but **Postgres has not been tested**. Switching
   providers requires changing the `datasource` in `prisma/schema.prisma`, supplying a
   `DATABASE_URL`, generating a client, and creating the schema.
-- `SESSION_SECRET` and `ATTENDANCE_THRESHOLD_PERCENT` are present in `.env.example` but are
-  **not read by the application**. Do not rely on them for security or configuration.
 - Serve over HTTPS and add HSTS.
-- The demo credential panel on the sign-in page is disabled automatically when
-  `NODE_ENV=production`; verify this before exposing the app publicly.
+- The demo credential panel is hidden when `NODE_ENV=production`. Set `SHOW_DEMO_ACCOUNTS=true`
+  only for a demo deployment; leave it unset when the app is public.
 
 ---
 

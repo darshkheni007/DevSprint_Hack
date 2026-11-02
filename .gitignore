@@ -14,3 +14,5 @@ coverage/
 .vitest/
 next-env.d.ts
 .DS_Store
+.vercel/
+.vercel-session-secret
