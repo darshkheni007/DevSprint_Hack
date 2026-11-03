@@ -27,6 +27,14 @@ function isServerlessRuntime(): boolean {
 }
 
 /**
+ * Try multiple candidate paths for a file, returning the first that exists.
+ * This is defence-in-depth for Vercel where cwd may vary.
+ */
+function findExistingPath(candidates: string[]): string | undefined {
+  return candidates.find((c) => existsSync(c));
+}
+
+/**
  * On Vercel, return a writable SQLite URL backed by the bundled seed database.
  * Every instance receives the same seeded file, so demo user IDs are stable
  * across instances and requests.
@@ -36,10 +44,13 @@ function resolveDatabaseUrl(): string | undefined {
 
   const target = join(tmpdir(), "smart-campus-demo.db");
   if (!existsSync(target)) {
-    const source = [
-      join(process.cwd(), "prisma", "seed.db"),
-      join(process.cwd(), "prisma", "dev.db"),
-    ].find((candidate) => existsSync(candidate));
+    const cwd = process.cwd();
+    const source = findExistingPath([
+      join(cwd, "prisma", "seed.db"),
+      join(cwd, "..", "prisma", "seed.db"),
+      join(cwd, "prisma", "dev.db"),
+      join(cwd, "..", "prisma", "dev.db"),
+    ]);
 
     if (!source) {
       throw new Error(

@@ -4,7 +4,7 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { prisma } from "./db";
 import { AppError } from "./errors";
@@ -20,10 +20,17 @@ import { AppError } from "./errors";
  * On Vercel the filesystem is ephemeral and each function instance may have its
  * own SQLite copy, so a database-backed session row cannot be shared between
  * requests. In that environment we issue a signed, stateless token instead. The
- * signature is HMAC-SHA256 over the user id and expiry, keyed by
- * `SESSION_SECRET` (or a per-deployment secret generated at build time). Any
- * instance can verify it, and the user record itself comes from the bundled
- * demo database, which is identical on every instance.
+ * signature is HMAC-SHA256 over the user id, expiry, and a password-hash
+ * fingerprint, keyed by `SESSION_SECRET` (or a per-deployment secret generated
+ * at build time). Any instance can verify it, and the user record itself comes
+ * from the bundled demo database, which is identical on every instance.
+ *
+ * The password-hash fingerprint (first 8 hex chars of SHA-256(passwordHash))
+ * binds the token to the user's current password. When the password changes,
+ * the fingerprint changes, invalidating existing stateless tokens on the
+ * instance that has the new hash. This does NOT provide cross-instance
+ * revocation because each Vercel instance has its own ephemeral database copy;
+ * logout/admin deactivation cannot propagate between instances.
  */
 export const SESSION_COOKIE = "campus_session";
 
@@ -38,6 +45,7 @@ const ABSOLUTE_MINUTES = Number.parseInt(
 
 const TOKEN_VERSION = "v1";
 const MIN_SECRET_LENGTH = 32;
+const PWD_FINGERPRINT_LENGTH = 8; // first 8 hex chars = 4 bytes
 
 function now(): Date {
   return new Date();
@@ -49,6 +57,11 @@ function idleExpiry(from: Date): Date {
 
 function absoluteExpiry(createdAt: Date): Date {
   return new Date(createdAt.getTime() + ABSOLUTE_MINUTES * 60_000);
+}
+
+/** Compute a short fingerprint of the password hash for token binding. */
+export function passwordFingerprint(passwordHash: string): string {
+  return createHash("sha256").update(passwordHash).digest("hex").slice(0, PWD_FINGERPRINT_LENGTH);
 }
 
 export function hashToken(token: string): string {
@@ -84,17 +97,33 @@ function sessionSecret(): string | null {
     return cachedSecret;
   }
 
-  try {
-    const fromFile = readFileSync(
-      join(process.cwd(), ".vercel-session-secret"),
-      "utf8",
-    ).trim();
-    cachedSecret =
-      fromFile.length >= MIN_SECRET_LENGTH ? fromFile : null;
-  } catch {
-    cachedSecret = null;
+  const cwd = process.cwd();
+  const secretPath = findExistingPath([
+    join(cwd, ".vercel-session-secret"),
+    join(cwd, "..", ".vercel-session-secret"),
+  ]);
+
+  if (secretPath) {
+    try {
+      const fromFile = readFileSync(secretPath, "utf8").trim();
+      cachedSecret = fromFile.length >= MIN_SECRET_LENGTH ? fromFile : null;
+      return cachedSecret;
+    } catch {
+      cachedSecret = null;
+      return cachedSecret;
+    }
   }
+
+  cachedSecret = null;
   return cachedSecret;
+}
+
+/**
+ * Try multiple candidate paths for a file, returning the first that exists.
+ * This is defence-in-depth for Vercel where cwd may vary.
+ */
+function findExistingPath(candidates: string[]): string | undefined {
+  return candidates.find((c) => existsSync(c));
 }
 
 function base64url(value: Buffer | string): string {
@@ -110,6 +139,7 @@ export function createSignedSessionToken(
   userId: string,
   expiresAt: Date,
   secret: string | null = sessionSecret(),
+  pwdFingerprint?: string,
 ): string {
   if (!secret) {
     throw new Error("Session signing secret is not configured.");
@@ -119,6 +149,7 @@ export function createSignedSessionToken(
       uid: userId,
       iat: Date.now(),
       exp: expiresAt.getTime(),
+      ...(pwdFingerprint ? { pwd: pwdFingerprint } : {}),
     }),
   );
   return `${TOKEN_VERSION}.${payload}.${sign(payload, secret).toString("base64url")}`;
@@ -128,7 +159,7 @@ export function createSignedSessionToken(
 export function verifySignedSessionToken(
   token: string,
   secret: string | null = sessionSecret(),
-): { userId: string; expiresAt: Date } | null {
+): { userId: string; expiresAt: Date; pwdFingerprint?: string } | null {
   if (!secret) return null;
 
   const parts = token.split(".");
@@ -147,12 +178,16 @@ export function verifySignedSessionToken(
   try {
     const parsed = JSON.parse(
       Buffer.from(payload, "base64url").toString("utf8"),
-    ) as { uid?: unknown; exp?: unknown };
+    ) as { uid?: unknown; exp?: unknown; pwd?: unknown };
     if (typeof parsed.uid !== "string" || typeof parsed.exp !== "number") {
       return null;
     }
     if (Date.now() >= parsed.exp) return null;
-    return { userId: parsed.uid, expiresAt: new Date(parsed.exp) };
+    return {
+      userId: parsed.uid,
+      expiresAt: new Date(parsed.exp),
+      ...(typeof parsed.pwd === "string" ? { pwdFingerprint: parsed.pwd } : {}),
+    };
   } catch {
     return null;
   }
@@ -184,11 +219,23 @@ export async function createSession(
         "Server session signing key is missing. Set SESSION_SECRET in the deployment environment.",
       );
     }
+    // Fetch the user's password hash to bind the token to the current password.
+    // This makes password changes invalidate stateless tokens on the instance
+    // that has the new hash (no cross-instance revocation due to ephemeral DB).
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { passwordHash: true },
+    });
+    if (!user) {
+      throw new AppError(404, "USER_NOT_FOUND", "User not found.");
+    }
+    const pwdFingerprint = passwordFingerprint(user.passwordHash);
+
     // Stateless tokens cannot slide their idle window, so use the absolute
     // expiry as the cookie lifetime.
     const expiresAt = absoluteExpiry(createdAt);
     return {
-      token: createSignedSessionToken(userId, expiresAt, secret),
+      token: createSignedSessionToken(userId, expiresAt, secret, pwdFingerprint),
       expiresAt,
     };
   }
@@ -221,7 +268,10 @@ export interface ValidatedSession {
  * slides the idle window forward. Returns null for any invalid/expired token.
  *
  * On Vercel the token is verified cryptographically instead, because the
- * session row lives on a different (ephemeral) instance.
+ * session row lives on a different (ephemeral) instance. The password-hash
+ * fingerprint in the token is compared against the user's current passwordHash
+ * to invalidate tokens when the password changes (on the instance with the new
+ * hash). This does NOT provide cross-instance revocation.
  */
 export async function validateSessionToken(
   token: string,
@@ -234,9 +284,15 @@ export async function validateSessionToken(
 
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
-      select: { id: true, role: true, isActive: true },
+      select: { id: true, role: true, isActive: true, passwordHash: true },
     });
     if (!user || !user.isActive) return null;
+
+    // Require the password-hash fingerprint. Tokens minted before this binding
+    // are rejected, and a signed token that omits the claim cannot bypass it.
+    if (!decoded.pwdFingerprint) return null;
+    const currentFingerprint = passwordFingerprint(user.passwordHash);
+    if (decoded.pwdFingerprint !== currentFingerprint) return null;
 
     return {
       sessionId: hashToken(token),
@@ -281,7 +337,8 @@ export async function validateSessionToken(
  * Invalidate one session server-side (logout, SEC-A06).
  *
  * Stateless tokens cannot be revoked server-side; clearing the cookie on the
- * client is the logout mechanism on Vercel.
+ * client is the logout mechanism on Vercel. Password changes invalidate tokens
+ * via the password-hash fingerprint on the instance that has the new hash.
  */
 export async function destroySession(token: string): Promise<void> {
   if (!token) return;

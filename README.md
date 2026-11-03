@@ -533,9 +533,12 @@ On serverless hosts (Vercel) the database file is ephemeral and per-instance, so
 cannot be shared between requests. In that environment the cookie is a stateless token signed
 with HMAC-SHA256 using `SESSION_SECRET` (or the per-deployment secret generated at build time).
 It is httpOnly, SameSite=Lax, Secure, and expires after the absolute session lifetime. The
-trade-off is that stateless tokens cannot be revoked server-side: logout clears the cookie, but
-a token copied from another device remains valid until it expires. For a real deployment, use a
-hosted Postgres/Turso database and database-backed sessions instead.
+token includes a password-hash fingerprint (first 8 hex chars of SHA-256(passwordHash)) so that
+password changes invalidate existing tokens **on the instance that has the new hash**. The
+trade-off is that stateless tokens cannot be fully revoked server-side across instances: logout
+clears the cookie, but a token copied from another device remains valid until it expires on
+instances that have not yet received the password change. For a real deployment, use a hosted
+Postgres/Turso database and database-backed sessions instead.
 
 **Authorization.** All protected operations go through `authorize(actor, action, ctx)` in
 `src/lib/permissions.ts`. The policy combines a role capability matrix with scope rules:
@@ -583,6 +586,11 @@ placeholders only. No environment variable is exposed to the browser.
 - Assistant questions are stored in plaintext in the query log for the asking user's own
   history. Do not type secrets into the assistant.
 - The assistant rate limit (10 questions per user per minute) is per account and not atomic.
+- **Stateless Vercel sessions use a password-hash fingerprint to invalidate tokens when the
+  password changes, but this only works on the instance that has the updated hash. Cross-instance
+  revocation (logout, admin deactivation) is not possible because each Vercel instance has its
+  own ephemeral database copy. For full revocation, use a hosted Postgres/Turso database with
+  database-backed sessions.**
 
 ---
 
@@ -593,8 +601,9 @@ Current limitations:
 - SQLite only; concurrent write throughput is limited by SQLite's single-writer model.
 - On Vercel, `/tmp` is ephemeral and per-instance. Reads and sign-in work, but writes are not
   shared between instances and are lost on cold start or redeploy.
-- Stateless Vercel sessions cannot be revoked server-side; a copied token remains valid until it
-  expires. Local database-backed sessions do support revocation.
+- Stateless Vercel sessions cannot be fully revoked server-side; a copied token remains valid
+  until it expires. However, password changes invalidate tokens via a password-hash fingerprint
+  on the instance that has the new hash. Local database-backed sessions do support full revocation.
 - Timetable generation is a deterministic constraint solver, not an optimizer — it finds a
   valid schedule, not necessarily the best one.
 - Notifications are in-app only; there is no email or SMS delivery.
